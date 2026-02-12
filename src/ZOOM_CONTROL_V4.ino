@@ -96,6 +96,7 @@ static const uint16_t POT_HYST_PAN   = 6;          // slightly higher to avoid c
 //   side=1  amount 0..72   (0 ≈ center, 72 = R100)
 static const uint8_t PAN_LEFT_MAX  = 127;          // amount at center  (side 0)
 static const uint8_t PAN_RIGHT_MAX = 74;           // amount at R100    (side 1, +2 margin)
+static const uint16_t PAN_CENTER_DEAD = 8;          // ±dead zone around norm 512 snaps to center
 
 // ============================================================================
 
@@ -426,21 +427,30 @@ static uint8_t mapNormToTrimRaw(uint16_t norm0_1023) {
 //   norm=0    -> side=0 amount=0   (L100, full left)
 //   norm=512  -> side=0 amount=127 (center)
 //   norm=1023 -> side=1 amount=72  (R100, full right)
+// A dead zone of ±PAN_CENTER_DEAD around 512 snaps to exact center.
 static void mapNormToPan(uint16_t norm0_1023, uint8_t& amount, uint8_t& side) {
-  if (norm0_1023 <= 512) {
-    // Left half + center:  norm 0..512 -> amount 0..127, side=0
+  const uint16_t cLo = 512u - PAN_CENTER_DEAD; // 504
+  const uint16_t cHi = 512u + PAN_CENTER_DEAD; // 520
+
+  if (norm0_1023 >= cLo && norm0_1023 <= cHi) {
+    // Dead zone: snap to exact center
+    side = 0;
+    amount = PAN_LEFT_MAX; // 127 = center
+  } else if (norm0_1023 < cLo) {
+    // Left: norm 0..cLo-1 -> amount 0..126, side=0
     side = 0;
     uint32_t x = norm0_1023;
-    uint32_t y = (x * (uint32_t)PAN_LEFT_MAX + 256u) / 512u;
-    if (y > PAN_LEFT_MAX) y = PAN_LEFT_MAX;
+    uint32_t y = (x * 126u + (cLo / 2)) / cLo;
+    if (y > 126u) y = 126u;
     amount = (uint8_t)y;
   } else {
-    // Right half:  norm 513..1023 -> amount 1..72, side=1
+    // Right: norm cHi+1..1023 -> amount 1..PAN_RIGHT_MAX, side=1
     side = 1;
-    uint32_t x = (uint32_t)(norm0_1023 - 512);  // 1..511
-    uint32_t y = (x * (uint32_t)PAN_RIGHT_MAX + 255u) / 511u;
+    uint32_t range = 1023u - cHi;  // 503
+    uint32_t x = (uint32_t)(norm0_1023 - cHi);  // 1..503
+    uint32_t y = (x * (uint32_t)PAN_RIGHT_MAX + (range / 2)) / range;
     if (y > PAN_RIGHT_MAX) y = PAN_RIGHT_MAX;
-    if (y == 0) y = 1;  // side=1 amount=0 not observed; clamp to 1
+    if (y == 0) y = 1;
     amount = (uint8_t)y;
   }
 }

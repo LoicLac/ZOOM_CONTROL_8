@@ -82,7 +82,14 @@ static const uint16_t POT_NOISE_GATE      = 2;     // ignore raw ADC change smal
 static const uint16_t POT_SNAP_MARGIN     = 6;     // snap to 0 or 1023 when within this margin
 
 // ---- Pot: Send throttle ----------------------------------------------------
-static const uint32_t POT_SEND_MIN_GAP_MS = 20;    // per-channel min send interval (ms)
+// Tuned for max ~3 faders at once; BLE can do ~66-133 writes/s total.
+static const uint32_t POT_SEND_MIN_GAP_MS = 12;    // per-channel min send interval (ms)
+
+// ---- Pot: Output ramp (adaptive: smooth when close, fast catch-up when far) ----
+// step = clamp(delta / DIV, MIN, MAX). Small move -> step 1; big move -> step up to MAX.
+static const uint16_t POT_RAMP_STEP_MIN   = 1;     // smoothness for small range / fine moves
+static const uint16_t POT_RAMP_STEP_MAX   = 128;   // catch-up: full range in ~8 sends (~0.2 s)
+static const uint16_t POT_RAMP_ADAPTIVE_DIV = 8;   // delta/8 -> step; big delta -> big step sooner
 
 // ---- Pot: Hysteresis (on normalized 0..1023, per mode) ---------------------
 // Change vs last-sent value must exceed this to trigger a new BLE send.
@@ -97,6 +104,11 @@ static const uint16_t POT_HYST_PAN   = 6;          // slightly higher to avoid c
 static const uint8_t PAN_LEFT_MAX  = 127;          // amount at center  (side 0)
 static const uint8_t PAN_RIGHT_MAX = 74;           // amount at R100    (side 1, +2 margin)
 static const uint16_t PAN_CENTER_DEAD = 8;          // ±dead zone around norm 512 snaps to center
+
+// ---- HOLD (4th bank) -------------------------------------------------------
+// Short press MODE: cycle FADER/PAN/TRIM. Long press (≥ this ms): enter HOLD bank; release quits.
+static const uint32_t HOLD_MODE_TIME_MS = 500;
+static const uint8_t  HOLDED_BANK       = 3;        // bank index for held values (persisted)
 
 // ============================================================================
 
@@ -129,6 +141,13 @@ static bool gSerialEnabled = true; // when false: no Serial.begin, no prints, no
 // ---------- Mode control ----------
 enum CtrlMode : uint8_t { MODE_FADER=0, MODE_PAN=1, MODE_TRIM=2 };
 static CtrlMode gMode = MODE_FADER;
+
+// HOLD: short press = cycle mode, long press = effective bank HOLDED_BANK; release never cycles.
+enum HoldState : uint8_t { HOLD_IDLE=0, HOLD_PRESSED, HOLD_ACTIVE };
+static HoldState gHoldState = HOLD_IDLE;
+static uint32_t  gModePressMs = 0;                  // time when MODE was debounced down
+static uint16_t  gHoldEntryBank3[8] = {0};          // snapshot of gBankVal[3][] on hold entry (for dirty check)
+uint8_t gCatchLedGlobalBrightnessPercent = 80;     // set by POT 7 in HOLD bank; for LED MISSION
 
 // ---------- Family A frames ----------
 struct Frame { const uint8_t* p; uint8_t n; };
@@ -381,9 +400,21 @@ static bool sendHello() {
   return writeBytes(hello, sizeof(hello));
 }
 
-// Raw (device format)
+// Raw (device format): input fader, ch = channel 0..7
 static bool sendFaderRaw(uint8_t ch, uint8_t val) {
   uint8_t p[5] = {0xA1,0x03,0x05,ch,val};
+  return writeBytes(p, 5);
+}
+
+// ---- Output faders (LR / MAIN / SUB) — same frame family A1 03 05 <ID> <VAL>, ID from btsnoop ----
+// FADER_LR_MIN_MAX / FADER_MAIN_MIN_MAX / FADER_SUB_MIN_MAX: VAL observed 0x00..0x79 (121)
+static const uint8_t FADER_OUT_ID_LR   = 0x08;   // POT 0 in HOLD bank
+static const uint8_t FADER_OUT_ID_MAIN = 0x0A;   // POT 1 in HOLD bank
+static const uint8_t FADER_OUT_ID_SUB  = 0x0C;   // POT 2 in HOLD bank
+static const uint8_t FADER_OUT_VAL_MAX = 121;    // 0x79, max value observed in captures
+
+static bool sendOutputFaderRaw(uint8_t outFaderId, uint8_t val) {
+  uint8_t p[5] = {0xA1, 0x03, 0x05, outFaderId, val};
   return writeBytes(p, 5);
 }
 
@@ -408,10 +439,18 @@ static uint16_t clampU16(int v, int lo, int hi) {
 }
 
 static uint8_t mapNormToFaderRaw(uint16_t norm0_1023) {
-  // 0..1023 -> 0..125 with rounding
+  // 0..1023 -> 0..125 with rounding (input fader)
   uint32_t x = norm0_1023;
   uint32_t y = (x * 125u + 511u) / 1023u;
   if (y > 125u) y = 125u;
+  return (uint8_t)y;
+}
+
+// 0..1023 -> 0..FADER_OUT_VAL_MAX for LR/MAIN/SUB output faders
+static uint8_t mapNormToOutputFaderRaw(uint16_t norm0_1023) {
+  uint32_t x = norm0_1023;
+  uint32_t y = (x * (uint32_t)FADER_OUT_VAL_MAX + 511u) / 1023u;
+  if (y > (uint32_t)FADER_OUT_VAL_MAX) y = FADER_OUT_VAL_MAX;
   return (uint8_t)y;
 }
 
@@ -468,6 +507,17 @@ static bool sendPanNorm(uint8_t ch, uint16_t norm0_1023) {
   uint8_t amount, side;
   mapNormToPan(norm0_1023, amount, side);
   return sendPanRaw(ch, amount, side);
+}
+
+// HOLD bank output faders: LR (POT 0), MAIN (POT 1), SUB (POT 2) — frame A1 03 05 <ID> <VAL>
+static bool sendLrFaderNorm(uint16_t norm0_1023) {
+  return sendOutputFaderRaw(FADER_OUT_ID_LR, mapNormToOutputFaderRaw(norm0_1023));
+}
+static bool sendMainFaderNorm(uint16_t norm0_1023) {
+  return sendOutputFaderRaw(FADER_OUT_ID_MAIN, mapNormToOutputFaderRaw(norm0_1023));
+}
+static bool sendSubFaderNorm(uint16_t norm0_1023) {
+  return sendOutputFaderRaw(FADER_OUT_ID_SUB, mapNormToOutputFaderRaw(norm0_1023));
 }
 
 // ---------- Serial commands (fader/trim/pan only, no log output) ----------
@@ -648,14 +698,17 @@ static void autoStep() {
 }
 
 // ---------- Per-bank value memory + pickup (catch) state ----------
-// 3 banks: MODE_FADER=0, MODE_PAN=1, MODE_TRIM=2
-static uint16_t gBankVal[3][8] = {{0}};  // last-sent value per bank per channel
-static bool     gCaught[3][8]  = {{0}};  // true = pot has picked up the stored value
+// 4 banks: MODE_FADER=0, MODE_PAN=1, MODE_TRIM=2, HOLDED_BANK=3 (hold only)
+static uint16_t gBankVal[4][8] = {{0}};  // last-sent value per bank per channel
+static bool     gCaught[4][8]  = {{0}};  // true = pot has picked up the stored value
 
 // ---------- Mode button + Pots ----------
 static uint32_t gLastBtnChangeMs = 0;
 static int gLastBtnStable = MODE_BTN_PULLUP ? HIGH : LOW;
 static int gLastBtnRead = MODE_BTN_PULLUP ? HIGH : LOW;
+
+static void holdBankLoad();   // load gBankVal[3][] from NVM (or defaults)
+static void holdBankSave();   // save gBankVal[3][] to NVM if supported
 
 static void modeButtonTick() {
   int raw = digitalRead(MODE_BTN_PIN);
@@ -666,22 +719,62 @@ static void modeButtonTick() {
     gLastBtnChangeMs = now;
   }
 
+  // While pressed and in PRESSED state, check for hold timeout
+  if (gHoldState == HOLD_PRESSED) {
+    bool stillPressed = MODE_BTN_PULLUP ? (gLastBtnRead == LOW) : (gLastBtnRead == HIGH);
+    if (stillPressed && (now - gModePressMs >= HOLD_MODE_TIME_MS)) {
+      gHoldState = HOLD_ACTIVE;
+      for (uint8_t i = 0; i < 8; i++) gHoldEntryBank3[i] = gBankVal[HOLDED_BANK][i];
+    }
+  }
+
   if ((now - gLastBtnChangeMs) >= BTN_DEBOUNCE_MS) {
     if (gLastBtnStable != gLastBtnRead) {
+      bool pressed = MODE_BTN_PULLUP ? (gLastBtnRead == LOW) : (gLastBtnRead == HIGH);
       gLastBtnStable = gLastBtnRead;
 
-      bool pressed = MODE_BTN_PULLUP ? (gLastBtnStable == LOW) : (gLastBtnStable == HIGH);
       if (pressed) {
-        // cycle
-        if (gMode == MODE_FADER) gMode = MODE_PAN;
-        else if (gMode == MODE_PAN) gMode = MODE_TRIM;
-        else gMode = MODE_FADER;
-
-        // Reset pickup flags: all pots must catch the stored value before sending
-        for (uint8_t i = 0; i < 8; i++) gCaught[gMode][i] = false;
+        // Press: record time; do not cycle
+        gModePressMs = now;
+        gHoldState = HOLD_PRESSED;
+      } else {
+        // Release
+        if (gHoldState == HOLD_ACTIVE) {
+          // Quit hold: persist HOLDED_BANK if any value changed
+          bool dirty = false;
+          for (uint8_t i = 0; i < 8; i++) {
+            if (gBankVal[HOLDED_BANK][i] != gHoldEntryBank3[i]) { dirty = true; break; }
+          }
+          if (dirty) holdBankSave();
+          gHoldState = HOLD_IDLE;
+        } else if (gHoldState == HOLD_PRESSED) {
+          // Short press: cycle FADER -> PAN -> TRIM -> FADER
+          if (gMode == MODE_FADER) gMode = MODE_PAN;
+          else if (gMode == MODE_PAN) gMode = MODE_TRIM;
+          else gMode = MODE_FADER;
+          for (uint8_t i = 0; i < 8; i++) gCaught[(uint8_t)gMode][i] = false;
+          gHoldState = HOLD_IDLE;
+        } else {
+          gHoldState = HOLD_IDLE;
+        }
       }
     }
   }
+}
+
+// HOLDED_BANK persistence (nRF52 has no EEPROM; use RAM placeholder until Flash/NVM added)
+static uint16_t gHoldBankNVM[8] = {512,512,512,512,512,512,512,512};
+
+static void holdBankLoad() {
+  for (uint8_t i = 0; i < 8; i++) {
+    gBankVal[HOLDED_BANK][i] = gHoldBankNVM[i];
+    gCaught[HOLDED_BANK][i] = false;
+  }
+}
+
+static void holdBankSave() {
+  for (uint8_t i = 0; i < 8; i++) gHoldBankNVM[i] = gBankVal[HOLDED_BANK][i];
+  // TODO: write gHoldBankNVM to flash (e.g. NanoBLEFlashPrefs / InternalFS) for power-cycle persistence
 }
 
 // Per-channel pot filter state
@@ -752,10 +845,10 @@ static void potsTick() {
     gPotInited[ch] = true;
     gPotFilt[ch] = med;
     gPotPrevFilt[ch] = med;
-    // Seed all 3 banks with the initial reading
+    // Seed banks 0..2 with first reading; bank 3 (HOLDED_BANK) already set by holdBankLoad()
     for (uint8_t m = 0; m < 3; m++) {
       gBankVal[m][ch] = med;
-      gCaught[m][ch] = (m == (uint8_t)gMode); // only current mode is caught
+      gCaught[m][ch] = (m == (uint8_t)gMode);
     }
     gPotLastSentMs[ch] = now;
     return;
@@ -771,12 +864,13 @@ static void potsTick() {
 
   gPotFilt[ch] = f;
 
-  uint8_t bank = (uint8_t)gMode;
+  uint8_t bank = (gHoldState == HOLD_ACTIVE) ? HOLDED_BANK : (uint8_t)gMode;
+  CtrlMode effMode = (bank == HOLDED_BANK) ? MODE_FADER : gMode;  // HOLD bank uses FADER hysteresis
 
   // --- Pickup / catch gate ---
   if (!gCaught[bank][ch]) {
     uint16_t target = gBankVal[bank][ch];
-    uint16_t hyst = potHysteresis(gMode, target);
+    uint16_t hyst = potHysteresis(effMode, target);
 
     // Catch if pot is within hysteresis of target, or has crossed through it
     bool withinHyst = (u16absdiff(f, target) <= hyst);
@@ -796,21 +890,51 @@ static void potsTick() {
 
   gPotPrevFilt[ch] = f;
 
-  // Send only on meaningful change vs bank value (hysteresis + min gap)
+  // Output ramp: adaptive step toward target (smooth when close, fast when far); rate-limited by throttle
   if (now - gPotLastSentMs[ch] < POT_SEND_MIN_GAP_MS) return;
 
-  uint16_t hyst = potHysteresis(gMode, f);
-  if (u16absdiff(f, gBankVal[bank][ch]) < hyst) return;
+  int32_t target = (int32_t)f;
+  int32_t cur = (int32_t)gBankVal[bank][ch];
+  int32_t delta = target - cur;
+  if (delta == 0) return;
+
+  uint16_t step = (uint16_t)(delta > 0 ? delta : -delta);
+  step = (uint16_t)(step / (uint32_t)POT_RAMP_ADAPTIVE_DIV);
+  if (step < POT_RAMP_STEP_MIN) step = POT_RAMP_STEP_MIN;
+  if (step > POT_RAMP_STEP_MAX) step = POT_RAMP_STEP_MAX;
+
+  int32_t next = cur + (delta > 0 ? (int32_t)step : -(int32_t)step);
+  if ((delta > 0 && next > target) || (delta < 0 && next < target)) next = target;
+  if (next < 0) next = 0;
+  if (next > 1023) next = 1023;
+  uint16_t nextVal = (uint16_t)next;
+  if (nextVal == gBankVal[bank][ch]) return;  // no change (shouldn't happen)
 
   bool ok = false;
-  switch (gMode) {
-    case MODE_FADER: ok = sendFaderNorm(ch, f); break;
-    case MODE_PAN:   ok = sendPanNorm(ch, f);   break;
-    case MODE_TRIM:  ok = sendTrimNorm(ch, f);  break;
+  if (bank == HOLDED_BANK) {
+    // POT 0 = LR, POT 1 = MAIN, POT 2 = SUB (output faders; A1 03 05 <ID> <VAL>, VAL 0..121)
+    if (ch == 0) {
+      ok = sendLrFaderNorm(nextVal);
+    } else if (ch == 1) {
+      ok = sendMainFaderNorm(nextVal);
+    } else if (ch == 2) {
+      ok = sendSubFaderNorm(nextVal);
+    } else if (ch <= 6) {
+      ok = true;  // ch 3..6: no BLE, just update bank state
+    } else {
+      gCatchLedGlobalBrightnessPercent = (uint8_t)((nextVal * 100u) / 1023u);
+      ok = true;  // ch 7: global brightness (LED MISSION)
+    }
+  } else {
+    switch (gMode) {
+      case MODE_FADER: ok = sendFaderNorm(ch, nextVal); break;
+      case MODE_PAN:   ok = sendPanNorm(ch, nextVal);   break;
+      case MODE_TRIM:  ok = sendTrimNorm(ch, nextVal);  break;
+    }
   }
 
   if (ok) {
-    gBankVal[bank][ch] = f;
+    gBankVal[bank][ch] = nextVal;
     gPotLastSentMs[ch] = now;
   }
 }
@@ -848,6 +972,7 @@ void setup() {
     enterState(ST_FAIL, "disconnected");
   });
 
+  holdBankLoad();  // restore HOLDED_BANK from NVM (or defaults)
   enterState(ST_BOOT, "setup done");
 }
 

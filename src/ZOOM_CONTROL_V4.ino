@@ -359,8 +359,27 @@ static void onTxNotification(BLEDevice, BLECharacteristic) {
     }
 
     if (subcmd == 0x02 && !gGotDumpFader) {
-      for (uint8_t i = 0; i < 8; i++)
-        gBankVal[MODE_FADER][i] = mapFaderRawToNorm(buf[3 + i]);
+      if (gSerialEnabled) {
+        Serial.print("FAD_RAW n="); Serial.print(n); Serial.print(" : ");
+        for (int j = 0; j < n; j++) {
+          if (buf[j] < 16) Serial.print('0');
+          Serial.print(buf[j], HEX); Serial.print(' ');
+        }
+        Serial.println();
+      }
+      for (uint8_t i = 0; i < 8; i++) {
+        uint8_t rawByte = buf[3 + i];
+        uint16_t norm = mapFaderRawToNorm(rawByte);
+        gBankVal[MODE_FADER][i] = norm;
+        if (gSerialEnabled) {
+          Serial.print("F"); Serial.print(i);
+          Serial.print(" idx="); Serial.print(3 + i);
+          Serial.print(" raw=0x"); if (rawByte < 16) Serial.print('0');
+          Serial.print(rawByte, HEX);
+          Serial.print("("); Serial.print(rawByte); Serial.print(")");
+          Serial.print(" norm="); Serial.println(norm);
+        }
+      }
       gBankVal[HOLDED_BANK][0] = mapOutputFaderRawToNorm(buf[11], 121);
       gBankVal[HOLDED_BANK][1] = mapOutputFaderRawToNorm(buf[13], 121);
       gBankVal[HOLDED_BANK][2] = mapOutputFaderRawToNorm(buf[15], 121);
@@ -428,8 +447,8 @@ static uint16_t clampU16(int v, int lo, int hi) {
 
 static uint8_t mapNormToFaderRaw(uint16_t norm0_1023) {
   uint32_t x = norm0_1023;
-  uint32_t y = (x * 125u + 511u) / 1023u;
-  if (y > 125u) y = 125u;
+  uint32_t y = (x * 121u + 511u) / 1023u;
+  if (y > 121u) y = 121u;
   return (uint8_t)y;
 }
 
@@ -475,17 +494,17 @@ static void mapNormToPan(uint16_t norm0_1023, uint8_t& amount, uint8_t& side) {
 
 static uint16_t mapFaderRawToNorm(uint8_t raw) {
   if (raw >= 121) return 1023;
-  return (uint16_t)((uint32_t)raw * 1023u + 60u) / 121u;
+  return (uint16_t)(((uint32_t)raw * 1023u + 60u) / 121u);
 }
 
 static uint16_t mapOutputFaderRawToNorm(uint8_t raw, uint8_t maxVal) {
   if (raw >= maxVal) return 1023;
-  return (uint16_t)((uint32_t)raw * 1023u + (maxVal / 2)) / (uint32_t)maxVal;
+  return (uint16_t)(((uint32_t)raw * 1023u + (maxVal / 2)) / (uint32_t)maxVal);
 }
 
 static uint16_t mapTrimRawToNorm(uint8_t raw) {
   if (raw >= 65) return 1023;
-  return (uint16_t)((uint32_t)raw * 1023u + 32u) / 65u;
+  return (uint16_t)(((uint32_t)raw * 1023u + 32u) / 65u);
 }
 
 static uint16_t mapPanRawToNorm(uint8_t amount, uint8_t side) {
@@ -495,7 +514,7 @@ static uint16_t mapPanRawToNorm(uint8_t amount, uint8_t side) {
   if (side == 0) {
     if (amount >= PAN_LEFT_MAX) return 512; // center
     // amount 0..126 -> norm 0..cLo-1
-    return (uint16_t)((uint32_t)amount * cLo + 63u) / 126u;
+    return (uint16_t)(((uint32_t)amount * cLo + 63u) / 126u);
   }
   // side == 1: amount 0..72 -> norm cHi+1..1023
   uint32_t range = 1023u - cHi; // 503
@@ -518,17 +537,6 @@ static bool sendPanNorm(uint8_t ch, uint16_t norm0_1023) {
   uint8_t amount, side;
   mapNormToPan(norm0_1023, amount, side);
   return sendPanRaw(ch, amount, side);
-}
-
-// HOLD bank output faders
-static bool sendLrFaderNorm(uint16_t norm0_1023) {
-  return sendOutputFaderRaw(FADER_OUT_ID_LR, mapNormToOutputFaderRaw(norm0_1023));
-}
-static bool sendMainFaderNorm(uint16_t norm0_1023) {
-  return sendOutputFaderRaw(FADER_OUT_ID_MAIN, mapNormToOutputFaderRaw(norm0_1023));
-}
-static bool sendSubFaderNorm(uint16_t norm0_1023) {
-  return sendOutputFaderRaw(FADER_OUT_ID_SUB, mapNormToOutputFaderRaw(norm0_1023));
 }
 
 // ---------- Serial commands ----------
@@ -945,6 +953,7 @@ static void potsTick() {
       }
       f = target;
       gPotFilt[ch] = f;
+      gPotFiltFP[ch] = (int32_t)f << POT_FRAC_BITS;
     } else {
       gPotPrevFilt[ch] = f;
       return; // not caught yet, skip send
@@ -959,42 +968,17 @@ static void potsTick() {
   uint16_t nextVal = f;
   if (nextVal == gBankVal[bank][ch]) return;
 
-  // Raw-change filters: only send when the actual BLE value changes.
-  // Fader/output fader: no remap (send function handles norm→raw conversion).
-  // Trim/pan: remap to snap gBankVal to raw step boundary (consistent mappings).
+  // Raw-change gate: compute raw once, send directly — no double conversion.
+  // gBankVal tracks f exactly (no remap). Pan keeps remap (amount+side encoding).
+  bool ok = false;
+
   if (bank == HOLDED_BANK) {
     if (ch <= 2) {
       uint8_t newRaw = mapNormToOutputFaderRaw(nextVal);
       uint8_t curRaw = mapNormToOutputFaderRaw(gBankVal[bank][ch]);
       if (newRaw == curRaw) return;
-    }
-  } else if (effMode == MODE_FADER) {
-    uint8_t newRaw = mapNormToFaderRaw(nextVal);
-    uint8_t curRaw = mapNormToFaderRaw(gBankVal[bank][ch]);
-    if (newRaw == curRaw) return;
-  } else if (effMode == MODE_TRIM) {
-    uint8_t newRaw = mapNormToTrimRaw(nextVal);
-    uint8_t curRaw = mapNormToTrimRaw(gBankVal[bank][ch]);
-    if (newRaw == curRaw) return;
-    nextVal = mapTrimRawToNorm(newRaw);
-  } else if (effMode == MODE_PAN) {
-    uint8_t newAmt, newSide;
-    mapNormToPan(nextVal, newAmt, newSide);
-    uint8_t curAmt, curSide;
-    mapNormToPan(gBankVal[bank][ch], curAmt, curSide);
-    if (curAmt == newAmt && curSide == newSide) return;
-    nextVal = mapPanRawToNorm(newAmt, newSide);
-  }
-  if (nextVal == gBankVal[bank][ch]) return;
-
-  bool ok = false;
-  if (bank == HOLDED_BANK) {
-    if (ch == 0) {
-      ok = sendLrFaderNorm(nextVal);
-    } else if (ch == 1) {
-      ok = sendMainFaderNorm(nextVal);
-    } else if (ch == 2) {
-      ok = sendSubFaderNorm(nextVal);
+      static const uint8_t HOLD_OUT_ID[] = {FADER_OUT_ID_LR, FADER_OUT_ID_MAIN, FADER_OUT_ID_SUB};
+      ok = sendOutputFaderRaw(HOLD_OUT_ID[ch], newRaw);
     } else if (ch <= 5) {
       ok = true;
     } else if (ch == 6) {
@@ -1006,12 +990,23 @@ static void potsTick() {
       brightSaveCatch();
       ok = true;
     }
-  } else {
-    switch (gMode) {
-      case MODE_FADER: ok = sendFaderNorm(ch, nextVal); break;
-      case MODE_PAN:   ok = sendPanNorm(ch, nextVal);   break;
-      case MODE_TRIM:  ok = sendTrimNorm(ch, nextVal);  break;
-    }
+  } else if (effMode == MODE_FADER) {
+    uint8_t newRaw = mapNormToFaderRaw(nextVal);
+    uint8_t curRaw = mapNormToFaderRaw(gBankVal[bank][ch]);
+    if (newRaw == curRaw) return;
+    ok = sendFaderRaw(ch, newRaw);
+  } else if (effMode == MODE_TRIM) {
+    uint8_t newRaw = mapNormToTrimRaw(nextVal);
+    uint8_t curRaw = mapNormToTrimRaw(gBankVal[bank][ch]);
+    if (newRaw == curRaw) return;
+    ok = sendTrimRaw(ch, newRaw);
+  } else if (effMode == MODE_PAN) {
+    uint8_t newAmt, newSide;
+    mapNormToPan(nextVal, newAmt, newSide);
+    uint8_t curAmt, curSide;
+    mapNormToPan(gBankVal[bank][ch], curAmt, curSide);
+    if (curAmt == newAmt && curSide == newSide) return;
+    ok = sendPanRaw(ch, newAmt, newSide);
   }
 
   if (ok) {

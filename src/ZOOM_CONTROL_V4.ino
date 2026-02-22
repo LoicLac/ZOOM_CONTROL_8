@@ -1,36 +1,40 @@
 /*
-  Zoom F8n Pro BLE - Auto connect + handshake + READY + Serial control (fader/trim/pan)
+  Zoom F8n Pro BLE Controller
   Board: Arduino Nano 33 BLE / BLE Rev2
-  Library: ArduinoBLE
+  Libraries: ArduinoBLE, Adafruit AW9523
 
-  LED states:
-    - SCAN  : slow blink (1.2 s)
-    - CONNECT/DISC/SUB/HANDSHAKE : fast blink (120 ms)
-    - READY : slow breathing (4 s cycle)
-    - FAIL / disconnected : triple-blink burst
+  Connects to a Zoom F8n Pro via BLE, performs the full handshake,
+  then controls 27 parameters with 8 physical potentiometers:
+    - 8 input faders  (bank FADER, 0..121 raw)
+    - 8 trims         (bank TRIM,  0..65 raw)
+    - 8 pans          (bank PAN,   amount+side encoding)
+    - 3 output faders (bank HOLD: LR 0..109, MAIN/SUB 0..121)
 
-  Serial commands (normalized 0..1023):
-    - fader  <ch 0..7> <val 0..1023>      -> maps to BLE 0..125
-    - trim   <ch 0..7> <val 0..1023>      -> maps to BLE 0..65
-    - pan    <ch 0..7> <val 0..1023>      -> maps to BLE 16-bit (piecewise around center)
-    - NO SERIAL mode (absolutely no Serial I/O):
-        hold MODE button while booting/resetting
+  At connection, the Zoom sends a state dump (3 A1 notifications:
+  sub-cmd 0x00=trim, 0x01=pan, 0x02=faders). These are parsed to
+  initialize gBankVal[][] so pots start with the real Zoom state.
+  All pots must "catch" (cross through) the target value before sending.
 
+  MODE button:
+    - Short press: cycle FADER -> PAN -> TRIM
+    - Long press (hold): enter HOLD bank (LR/MAIN/SUB + brightness)
+    - Hold during boot: disable serial entirely
 
-    - Read continuously (when READY)
-    - A button cycles mode: FADER -> PAN -> TRIM -> ...
-    - For current mode, each pot i controls channel i with normalized 0..1023
+  LED (AW9523):
+    - Pins 0-7: catch LEDs (brightness proportional to distance from target)
+    - Pins 8-10: RGB status (green=FADER, yellow=PAN, red=TRIM, blue=HOLD)
+    - Not connected: slow white blink; AW9523 absent: built-in LED fast blink
 
-  Notes:
-    - PAN encoding is two separate bytes: A1 04 04 ch <amount> <side>
-        side=0: left/center, amount 0 (L100) .. 127 (center)
-        side=1: right,       amount 0 (near center) .. 72 (R100)
-      Values 128..255 in the amount byte are INVALID (gap confirmed by btsnoop).
+  Serial (115200, when enabled):
+    - fader <ch 0..7> <val 0..1023>
+    - trim  <ch 0..7> <val 0..1023>
+    - pan   <ch 0..7> <val 0..1023>
 */
 
 #include <ArduinoBLE.h>
 #include <Wire.h>
 #include <Adafruit_AW9523.h>
+#include <NanoBLEFlashPrefs.h>
 
 // ============================================================================
 //  COMPILE-TIME CONFIG — all user-tunable values grouped here
@@ -50,10 +54,6 @@ static const uint32_t SCAN_TIMEOUT_MS   = 15000;  // max scan duration before re
 static const uint32_t READY_TIMEOUT_MS  = 15000;  // max wait for 0x83 ready notification
 static const uint32_t WRITE_GAP_MS      = 30;     // min gap between BLE writes (ms)
 static const uint32_t RETRY_DELAY_MS    = 1200;   // pause before auto-retry after failure
-
-// ---- BLE: Keepalive --------------------------------------------------------
-static const bool     USE_KEEPALIVE        = false;
-static const uint32_t KEEPALIVE_PERIOD_MS  = 200;
 
 // ---- BLE: Liveness watchdog ------------------------------------------------
 // If no notification received for this long while READY, assume link dead.
@@ -100,17 +100,13 @@ static const uint16_t POT_HYST_TRIM  = 4;
 static const uint16_t POT_HYST_PAN   = 6;          // slightly higher to avoid center jitter
 
 // ---- PAN encoding ----------------------------------------------------------
-// Two-field BLE encoding:  <amount> <side>
-//   side=0  amount 0..127  (0 = L100, 127 = center)
-//   side=1  amount 0..72   (0 ≈ center, 72 = R100)
-static const uint8_t PAN_LEFT_MAX  = 127;          // amount at center  (side 0)
-static const uint8_t PAN_RIGHT_MAX = 74;           // amount at R100    (side 1, +2 margin)
-static const uint16_t PAN_CENTER_DEAD = 8;          // ±dead zone around norm 512 snaps to center
+static const uint8_t PAN_LEFT_MAX  = 127;          // side=0 amount at center
+static const uint8_t PAN_RIGHT_MAX = 74;           // side=1 amount at R100 (+2 margin)
+static const uint16_t PAN_CENTER_DEAD = 8;          // ±dead zone around norm 512
 
 // ---- HOLD (4th bank) -------------------------------------------------------
-// Short press MODE: cycle FADER/PAN/TRIM. Long press (≥ this ms): enter HOLD bank; release quits.
 static const uint32_t HOLD_MODE_TIME_MS = 500;
-static const uint8_t  HOLDED_BANK       = 3;        // bank index for held values (persisted)
+static const uint8_t  HOLDED_BANK       = 3;
 
 // ---- AW9523 / Catch LEDs --------------------------------------------------
 static const uint8_t AW9523_ADDR         = 0x58;
@@ -136,9 +132,9 @@ static const uint8_t BANK_COLOR[][3] = {
 
 // ============================================================================
 
-// ---------- Internal state ----------
+// ---------- BLE connection state machine ----------
 enum AutoState {
-  ST_BOOT=0, ST_SCAN, ST_CONNECT, ST_DISCOVER, ST_SUBSCRIBE, ST_KEEPALIVE_ON,
+  ST_BOOT=0, ST_SCAN, ST_CONNECT, ST_DISCOVER, ST_SUBSCRIBE,
   ST_SEND_HELLO, ST_SEND_FAMILY_A, ST_WAIT_READY, ST_READY, ST_FAIL
 };
 
@@ -151,33 +147,34 @@ BLECharacteristic chTx, chRx, chFlow;
 bool hasSvc=false, hasTx=false, hasRx=false, hasFlow=false;
 bool readyFlag=false;
 
-uint32_t lastKeepaliveMs=0;
-uint32_t tStateEnterMs=0;
+// State dump reception flags (set when A1 sub-cmd 0x00/0x01/0x02 parsed)
+static bool gGotDumpTrim  = false;
+static bool gGotDumpPan   = false;
+static bool gGotDumpFader = false;
 
+uint32_t tStateEnterMs=0;
 uint32_t lastAnyNotifMs=0;
 uint32_t last83Ms=0;
 
 String cmdBuf;
 
-// ---------- Runtime options ----------
-static bool gSerialEnabled = true; // when false: no Serial.begin, no prints, no reads
+static bool gSerialEnabled = true;
 
-// ---------- Mode control ----------
+// ---------- Mode / bank control ----------
 enum CtrlMode : uint8_t { MODE_FADER=0, MODE_PAN=1, MODE_TRIM=2 };
 static CtrlMode gMode = MODE_FADER;
 
-// HOLD: short press = cycle mode, long press = effective bank HOLDED_BANK; release never cycles.
 enum HoldState : uint8_t { HOLD_IDLE=0, HOLD_PRESSED, HOLD_ACTIVE };
 static HoldState gHoldState = HOLD_IDLE;
-static uint32_t  gModePressMs = 0;                  // time when MODE was debounced down
-static uint16_t  gHoldEntryBank3[8] = {0};          // snapshot of gBankVal[3][] on hold entry (for dirty check)
+static uint32_t  gModePressMs = 0;
+static uint16_t  gHoldEntryBank3[8] = {0};
 
-// ---- AW9523 / LED VISION V2 -------------------------------------------------
+// ---------- AW9523 LED driver ----------
 static Adafruit_AW9523 aw9523;
 static bool gAw9523Ok = false;
-static uint8_t gVisionLedBrightnessPercent = 100;  // POT 6 in HOLD; separate from catch LED
-uint8_t gCatchLedGlobalBrightnessPercent = 100;     // set by POT 7 in HOLD bank
-static uint8_t  gBlinkPhase[8] = {0};               // 0=inactive; 1-6 = on/off phases (3 blinks)
+static uint8_t gVisionLedBrightnessPercent = 100;   // HOLD POT 6
+uint8_t gCatchLedGlobalBrightnessPercent = 100;      // HOLD POT 7
+static uint8_t  gBlinkPhase[8] = {0};
 static uint32_t gBlinkStartMs[8] = {0};
 
 // ---------- Family A frames ----------
@@ -230,11 +227,9 @@ static const Frame FAMILY_A[] = {
   {F35,4},{F36,4},{F37,4},{F38,2}
 };
 
-// Forward decl
 static bool writeBytes(const uint8_t* p, size_t n);
 
-// ---------- Family A sender (non-blocking) ----------
-// Sends 1 frame per tick, spaced by WRITE_GAP_MS, so BLE.poll()/notifs keep running.
+// ---------- Family A sender (non-blocking, 1 frame per tick) ----------
 static bool     gFamAActive = false;
 static size_t   gFamAIdx = 0;
 static uint32_t gFamALastWriteMs = 0;
@@ -273,7 +268,7 @@ static int famATick() {
   return 0;
 }
 
-// ---------- Startup-only print (no String, no heap alloc) ----------
+// ---------- Serial helpers ----------
 static void startupPrint(const char* msg) {
   if (!gSerialEnabled) return;
   Serial.print(millis());
@@ -301,13 +296,12 @@ static void hardFail(const char* why) {
   enterState(ST_FAIL, why);
 }
 
-// ---------- LED: built-in only when AW9523 failed (VisionLed handles status when OK) ----------
+// ---------- LED: built-in fallback when AW9523 absent ----------
 static void ledUpdate() {
   if (gAw9523Ok) {
     digitalWrite(LED_PIN, LOW);
     return;
   }
-  // AW9523 failed: permanent fast blink on built-in LED
   uint32_t elapsed = millis() % 120u;
   digitalWrite(LED_PIN, elapsed < 60 ? HIGH : LOW);
 }
@@ -321,8 +315,8 @@ static void resetVarsButKeepBLE() {
   chFlow = BLECharacteristic();
   hasSvc=hasTx=hasRx=hasFlow=false;
   readyFlag=false;
-  lastKeepaliveMs=0;
   lastAnyNotifMs=last83Ms=0;
+  gGotDumpTrim=gGotDumpPan=gGotDumpFader=false;
   famAReset();
 }
 
@@ -330,22 +324,59 @@ static void disconnectIfNeeded() {
   if (zoomDev && zoomDev.connected()) zoomDev.disconnect();
 }
 
+// ---------- Per-bank value memory (0=FADER, 1=PAN, 2=TRIM, 3=HOLD) ----------
+// Initialized from Zoom state dump at connection; pots must catch before sending.
+static uint16_t gBankVal[4][8] = {{0}};  // normalized 0..1023 per bank per channel
+static bool     gCaught[4][8]  = {{0}};  // true = pot has picked up the stored value
+
+// Notification callback — fires for EVERY notification, no loss from single-buffer
+static void onTxNotification(BLEDevice, BLECharacteristic) {
+  int n = chTx.valueLength();
+  uint8_t buf[32];
+  if (n > (int)sizeof(buf)) n = sizeof(buf);
+  chTx.readValue(buf, n);
+
+  lastAnyNotifMs = millis();
+  if (n >= 2 && buf[0] == 0x83 && buf[1] == 0x0E) last83Ms = millis();
+
+  // Flow control ACK: the Zoom expects 80 01 00 after each notification
+  if (hasRx) {
+    static const uint8_t ack[] = {0x80, 0x01, 0x00};
+    chRx.writeValue(ack, sizeof(ack));
+  }
+
+  if (buf[0] == 0xA1 && n >= 17) {
+    uint8_t subcmd = buf[2];
+
+    if (subcmd == 0x00 && n >= 19 && !gGotDumpTrim) {
+      for (uint8_t i = 0; i < 8; i++)
+        gBankVal[MODE_TRIM][i] = mapTrimRawToNorm(buf[3 + i * 2]);
+      gGotDumpTrim = true;
+    }
+
+    if (subcmd == 0x01 && n >= 19 && !gGotDumpPan) {
+      for (uint8_t i = 0; i < 8; i++)
+        gBankVal[MODE_PAN][i] = mapPanRawToNorm(buf[3 + i * 2], buf[4 + i * 2]);
+      gGotDumpPan = true;
+    }
+
+    if (subcmd == 0x02 && !gGotDumpFader) {
+      for (uint8_t i = 0; i < 8; i++)
+        gBankVal[MODE_FADER][i] = mapFaderRawToNorm(buf[3 + i]);
+      gBankVal[HOLDED_BANK][0] = mapOutputFaderRawToNorm(buf[11], 109);
+      gBankVal[HOLDED_BANK][1] = mapOutputFaderRawToNorm(buf[13], 121);
+      gBankVal[HOLDED_BANK][2] = mapOutputFaderRawToNorm(buf[15], 121);
+      gGotDumpFader = true;
+    }
+  }
+}
+
 static void pollNotifs() {
   if (!zoomDev || !zoomDev.connected()) return;
 
-  if (hasTx && chTx.valueUpdated()) {
-    int n = chTx.valueLength();
-    uint8_t buf[32];
-    if (n > (int)sizeof(buf)) n = sizeof(buf);
-    chTx.readValue(buf, n);
-
-    lastAnyNotifMs = millis();
-    if (n>=2 && buf[0]==0x83 && buf[1]==0x0E) last83Ms = millis();
-  }
-
   if (hasFlow && chFlow.valueUpdated()) {
     int n = chFlow.valueLength();
-    uint8_t buf[8];
+    uint8_t buf[32];
     if (n > (int)sizeof(buf)) n = sizeof(buf);
     chFlow.readValue(buf, n);
     lastAnyNotifMs = millis();
@@ -357,19 +388,7 @@ static bool writeBytes(const uint8_t* p, size_t n) {
   return chRx.writeValue(p, n);
 }
 
-static void keepaliveTick() {
-  if (!USE_KEEPALIVE) return;
-  if (!zoomDev || !zoomDev.connected()) return;
-  if (!hasRx) return;
-  uint32_t now = millis();
-  if (now - lastKeepaliveMs >= KEEPALIVE_PERIOD_MS) {
-    const uint8_t a[] = {0x80,0x01,0x00};
-    chRx.writeValue(a, sizeof(a));
-    lastKeepaliveMs = now;
-  }
-}
-
-// ---------- Protocol tx ----------
+// ---------- Protocol tx: send parameter values to Zoom ----------
 static bool sendHello() {
   const uint8_t hello[] = {0xD1,0x12,0x32,0x2E,0x33,0x2E,0x31,
                            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
@@ -377,38 +396,32 @@ static bool sendHello() {
   return writeBytes(hello, sizeof(hello));
 }
 
-// Raw (device format): input fader, ch = channel 0..7
 static bool sendFaderRaw(uint8_t ch, uint8_t val) {
   uint8_t p[5] = {0xA1,0x03,0x05,ch,val};
   return writeBytes(p, 5);
 }
 
-// ---- Output faders (LR / MAIN / SUB) — same frame family A1 03 05 <ID> <VAL>, ID from btsnoop ----
-// FADER_LR_MIN_MAX / FADER_MAIN_MIN_MAX / FADER_SUB_MIN_MAX: VAL observed 0x00..0x79 (121)
-static const uint8_t FADER_OUT_ID_LR   = 0x08;   // POT 0 in HOLD bank
-static const uint8_t FADER_OUT_ID_MAIN = 0x0A;   // POT 1 in HOLD bank
-static const uint8_t FADER_OUT_ID_SUB  = 0x0C;   // POT 2 in HOLD bank
-static const uint8_t FADER_OUT_VAL_MAX = 121;    // 0x79, max value observed in captures
+static const uint8_t FADER_OUT_ID_LR   = 0x08;
+static const uint8_t FADER_OUT_ID_MAIN = 0x0A;
+static const uint8_t FADER_OUT_ID_SUB  = 0x0C;
+static const uint8_t FADER_OUT_VAL_MAX = 121;
 
 static bool sendOutputFaderRaw(uint8_t outFaderId, uint8_t val) {
   uint8_t p[5] = {0xA1, 0x03, 0x05, outFaderId, val};
   return writeBytes(p, 5);
 }
 
-// From btsnoop: A1 04 03 ch trim 00, trim in [0..65]
 static bool sendTrimRaw(uint8_t ch, uint8_t trimVal) {
   uint8_t p[6] = {0xA1,0x04,0x03,ch,trimVal,0x00};
   return writeBytes(p, 6);
 }
 
-// From btsnoop: A1 04 04 ch <amount> <side>
-//   side=0 amount=0..127 (left/center)   side=1 amount=0..72 (right)
 static bool sendPanRaw(uint8_t ch, uint8_t amount, uint8_t side) {
   uint8_t p[6] = {0xA1,0x04,0x04,ch,amount,side};
   return writeBytes(p, 6);
 }
 
-// ---------- Normalization helpers (0..1023) ----------
+// ---------- Norm <-> Raw mapping (0..1023 <-> BLE values) ----------
 static uint16_t clampU16(int v, int lo, int hi) {
   if (v < lo) return (uint16_t)lo;
   if (v > hi) return (uint16_t)hi;
@@ -416,14 +429,12 @@ static uint16_t clampU16(int v, int lo, int hi) {
 }
 
 static uint8_t mapNormToFaderRaw(uint16_t norm0_1023) {
-  // 0..1023 -> 0..125 with rounding (input fader)
   uint32_t x = norm0_1023;
   uint32_t y = (x * 125u + 511u) / 1023u;
   if (y > 125u) y = 125u;
   return (uint8_t)y;
 }
 
-// 0..1023 -> 0..FADER_OUT_VAL_MAX for LR/MAIN/SUB output faders
 static uint8_t mapNormToOutputFaderRaw(uint16_t norm0_1023) {
   uint32_t x = norm0_1023;
   uint32_t y = (x * (uint32_t)FADER_OUT_VAL_MAX + 511u) / 1023u;
@@ -432,35 +443,26 @@ static uint8_t mapNormToOutputFaderRaw(uint16_t norm0_1023) {
 }
 
 static uint8_t mapNormToTrimRaw(uint16_t norm0_1023) {
-  // 0..1023 -> 0..65 with rounding
   uint32_t x = norm0_1023;
   uint32_t y = (x * 65u + 511u) / 1023u;
   if (y > 65u) y = 65u;
   return (uint8_t)y;
 }
 
-// Map normalized 0..1023 to PAN two-field encoding.
-//   norm=0    -> side=0 amount=0   (L100, full left)
-//   norm=512  -> side=0 amount=127 (center)
-//   norm=1023 -> side=1 amount=72  (R100, full right)
-// A dead zone of ±PAN_CENTER_DEAD around 512 snaps to exact center.
 static void mapNormToPan(uint16_t norm0_1023, uint8_t& amount, uint8_t& side) {
   const uint16_t cLo = 512u - PAN_CENTER_DEAD; // 504
   const uint16_t cHi = 512u + PAN_CENTER_DEAD; // 520
 
   if (norm0_1023 >= cLo && norm0_1023 <= cHi) {
-    // Dead zone: snap to exact center
     side = 0;
-    amount = PAN_LEFT_MAX; // 127 = center
+    amount = PAN_LEFT_MAX;
   } else if (norm0_1023 < cLo) {
-    // Left: norm 0..cLo-1 -> amount 0..126, side=0
     side = 0;
     uint32_t x = norm0_1023;
     uint32_t y = (x * 126u + (cLo / 2)) / cLo;
     if (y > 126u) y = 126u;
     amount = (uint8_t)y;
   } else {
-    // Right: norm cHi+1..1023 -> amount 1..PAN_RIGHT_MAX, side=1
     side = 1;
     uint32_t range = 1023u - cHi;  // 503
     uint32_t x = (uint32_t)(norm0_1023 - cHi);  // 1..503
@@ -471,7 +473,41 @@ static void mapNormToPan(uint16_t norm0_1023, uint8_t& amount, uint8_t& side) {
   }
 }
 
-// Public normalized API used by serial + pot placeholder
+// ---------- Inverse mapping (Zoom state dump raw -> norm 0..1023) ----------
+
+static uint16_t mapFaderRawToNorm(uint8_t raw) {
+  if (raw >= 121) return 1023;
+  return (uint16_t)((uint32_t)raw * 1023u + 60u) / 121u;
+}
+
+static uint16_t mapOutputFaderRawToNorm(uint8_t raw, uint8_t maxVal) {
+  if (raw >= maxVal) return 1023;
+  return (uint16_t)((uint32_t)raw * 1023u + (maxVal / 2)) / (uint32_t)maxVal;
+}
+
+static uint16_t mapTrimRawToNorm(uint8_t raw) {
+  if (raw >= 65) return 1023;
+  return (uint16_t)((uint32_t)raw * 1023u + 32u) / 65u;
+}
+
+static uint16_t mapPanRawToNorm(uint8_t amount, uint8_t side) {
+  const uint16_t cLo = 512u - PAN_CENTER_DEAD; // 504
+  const uint16_t cHi = 512u + PAN_CENTER_DEAD; // 520
+
+  if (side == 0) {
+    if (amount >= PAN_LEFT_MAX) return 512; // center
+    // amount 0..126 -> norm 0..cLo-1
+    return (uint16_t)((uint32_t)amount * cLo + 63u) / 126u;
+  }
+  // side == 1: amount 0..72 -> norm cHi+1..1023
+  uint32_t range = 1023u - cHi; // 503
+  uint32_t n = cHi + ((uint32_t)amount * range + 36u) / (uint32_t)PAN_RIGHT_MAX;
+  if (n > 1023u) n = 1023u;
+  if (n <= cHi) n = cHi + 1;
+  return (uint16_t)n;
+}
+
+// ---------- Public normalized send API ----------
 static bool sendFaderNorm(uint8_t ch, uint16_t norm0_1023) {
   return sendFaderRaw(ch, mapNormToFaderRaw(norm0_1023));
 }
@@ -486,7 +522,7 @@ static bool sendPanNorm(uint8_t ch, uint16_t norm0_1023) {
   return sendPanRaw(ch, amount, side);
 }
 
-// HOLD bank output faders: LR (POT 0), MAIN (POT 1), SUB (POT 2) — frame A1 03 05 <ID> <VAL>
+// HOLD bank output faders
 static bool sendLrFaderNorm(uint16_t norm0_1023) {
   return sendOutputFaderRaw(FADER_OUT_ID_LR, mapNormToOutputFaderRaw(norm0_1023));
 }
@@ -497,7 +533,7 @@ static bool sendSubFaderNorm(uint16_t norm0_1023) {
   return sendOutputFaderRaw(FADER_OUT_ID_SUB, mapNormToOutputFaderRaw(norm0_1023));
 }
 
-// ---------- Serial commands (fader/trim/pan only, no log output) ----------
+// ---------- Serial commands ----------
 static void handleSerialLine(String s) {
   if (!gSerialEnabled) return;
   s.trim();
@@ -600,6 +636,7 @@ static void autoStep() {
     case ST_SUBSCRIBE: {
       if (hasTx && chTx.canSubscribe()) {
         if (!chTx.subscribe()) { hardFail("sub TX failed"); return; }
+        chTx.setEventHandler(BLEUpdated, onTxNotification);
       } else {
         hardFail("TX cannot subscribe");
         return;
@@ -609,13 +646,9 @@ static void autoStep() {
         chFlow.subscribe(); // FLOW not mandatory
       }
 
-      enterState(ST_KEEPALIVE_ON, "subscribed");
+      enterState(ST_SEND_HELLO, "subscribed");
       break;
     }
-
-    case ST_KEEPALIVE_ON:
-      enterState(ST_SEND_HELLO, "keepalive stage");
-      break;
 
     case ST_SEND_HELLO: {
       bool ok = sendHello();
@@ -641,6 +674,24 @@ static void autoStep() {
     case ST_WAIT_READY: {
       if (last83Ms != 0 && (last83Ms >= tStateEnterMs)) {
         readyFlag = true;
+        for (uint8_t b = 0; b < 4; b++)
+          for (uint8_t c = 0; c < 8; c++)
+            gCaught[b][c] = false;
+
+        if (gSerialEnabled && gGotDumpFader && gGotDumpTrim && gGotDumpPan) {
+          Serial.print("DUMP F:");
+          for (uint8_t i = 0; i < 8; i++) { Serial.print(' '); Serial.print(gBankVal[MODE_FADER][i]); }
+          Serial.print(" T:");
+          for (uint8_t i = 0; i < 8; i++) { Serial.print(' '); Serial.print(gBankVal[MODE_TRIM][i]); }
+          Serial.print(" P:");
+          for (uint8_t i = 0; i < 8; i++) { Serial.print(' '); Serial.print(gBankVal[MODE_PAN][i]); }
+          Serial.print(" LR:"); Serial.print(gBankVal[HOLDED_BANK][0]);
+          Serial.print(" MAIN:"); Serial.print(gBankVal[HOLDED_BANK][1]);
+          Serial.print(" SUB:"); Serial.println(gBankVal[HOLDED_BANK][2]);
+        } else if (gSerialEnabled) {
+          startupPrint("DUMP incomplete");
+        }
+
         startupPrint("READY");
         enterState(ST_READY, "ready");
         return;
@@ -674,18 +725,11 @@ static void autoStep() {
   }
 }
 
-// ---------- Per-bank value memory + pickup (catch) state ----------
-// 4 banks: MODE_FADER=0, MODE_PAN=1, MODE_TRIM=2, HOLDED_BANK=3 (hold only)
-static uint16_t gBankVal[4][8] = {{0}};  // last-sent value per bank per channel
-static bool     gCaught[4][8]  = {{0}};  // true = pot has picked up the stored value
-
 // ---------- Mode button + Pots ----------
 static uint32_t gLastBtnChangeMs = 0;
 static int gLastBtnStable = MODE_BTN_PULLUP ? HIGH : LOW;
 static int gLastBtnRead = MODE_BTN_PULLUP ? HIGH : LOW;
 
-static void holdBankLoad();   // load gBankVal[3][] from NVM (or defaults)
-static void holdBankSave();   // save gBankVal[3][] to NVM if supported
 
 static void modeButtonTick() {
   int raw = digitalRead(MODE_BTN_PIN);
@@ -720,13 +764,8 @@ static void modeButtonTick() {
       } else {
         // Release
         if (gHoldState == HOLD_ACTIVE) {
-          // Quit hold: persist HOLDED_BANK if any value changed
-          bool dirty = false;
-          for (uint8_t i = 0; i < 8; i++) {
-            if (gBankVal[HOLDED_BANK][i] != gHoldEntryBank3[i]) { dirty = true; break; }
+          for (uint8_t i = 0; i < 8; i++)
             gBlinkPhase[i] = 0;
-          }
-          if (dirty) holdBankSave();
           gHoldState = HOLD_IDLE;
         } else if (gHoldState == HOLD_PRESSED) {
           // Short press: cycle FADER -> PAN -> TRIM -> FADER
@@ -746,48 +785,49 @@ static void modeButtonTick() {
   }
 }
 
-// HOLDED_BANK persistence (nRF52 has no EEPROM; use RAM placeholder until Flash/NVM added)
-static uint16_t gHoldBankNVM[8] = {512,512,512,512,512,512,512,512};
-
-static void holdBankLoad() {
-  for (uint8_t i = 0; i < 8; i++) {
-    gBankVal[HOLDED_BANK][i] = gHoldBankNVM[i];
-    gCaught[HOLDED_BANK][i] = false;
-  }
-}
-
-static void holdBankSave() {
-  for (uint8_t i = 0; i < 8; i++) gHoldBankNVM[i] = gBankVal[HOLDED_BANK][i];
-  // TODO: write gHoldBankNVM to flash (e.g. NanoBLEFlashPrefs / InternalFS) for power-cycle persistence
-}
-
-// Brightness persistence (separate from HOLDED_BANK; RAM placeholder)
-static uint8_t gVisionLedBrightNVM  = 100;
-static uint8_t gCatchLedBrightNVM   = 100;
+// Brightness persistence (own NVM, separate from HOLDED_BANK; survives power cycle)
+#define BRIGHT_PREFS_MAGIC 0xAB
+typedef struct { uint8_t magic; uint8_t visionPct; uint8_t catchPct; } BrightPrefs;
+static NanoBLEFlashPrefs brightFlash;
+static BrightPrefs brightPrefsBuf;
 
 static void brightLoad() {
-  gVisionLedBrightnessPercent      = gVisionLedBrightNVM;
-  gCatchLedGlobalBrightnessPercent = gCatchLedBrightNVM;
+  int rc = brightFlash.readPrefs(&brightPrefsBuf, sizeof(brightPrefsBuf));
+  if (rc == 0 && brightPrefsBuf.magic == BRIGHT_PREFS_MAGIC &&
+      brightPrefsBuf.visionPct <= 100 && brightPrefsBuf.catchPct <= 100) {
+    gVisionLedBrightnessPercent      = brightPrefsBuf.visionPct;
+    gCatchLedGlobalBrightnessPercent = brightPrefsBuf.catchPct;
+  }
+  // else keep defaults (100)
 }
 
 static void brightSaveVision() {
-  gVisionLedBrightNVM = gVisionLedBrightnessPercent;
-  // TODO: write to flash (NanoBLEFlashPrefs)
+  if (brightFlash.readPrefs(&brightPrefsBuf, sizeof(brightPrefsBuf)) != 0) {
+    brightPrefsBuf.magic   = BRIGHT_PREFS_MAGIC;
+    brightPrefsBuf.visionPct = 100;
+    brightPrefsBuf.catchPct  = 100;
+  }
+  brightPrefsBuf.visionPct = gVisionLedBrightnessPercent;
+  brightFlash.writePrefs(&brightPrefsBuf, sizeof(brightPrefsBuf));
 }
 
 static void brightSaveCatch() {
-  gCatchLedBrightNVM = gCatchLedGlobalBrightnessPercent;
-  // TODO: write to flash (NanoBLEFlashPrefs)
+  if (brightFlash.readPrefs(&brightPrefsBuf, sizeof(brightPrefsBuf)) != 0) {
+    brightPrefsBuf.magic   = BRIGHT_PREFS_MAGIC;
+    brightPrefsBuf.visionPct = 100;
+    brightPrefsBuf.catchPct  = 100;
+  }
+  brightPrefsBuf.catchPct = gCatchLedGlobalBrightnessPercent;
+  brightFlash.writePrefs(&brightPrefsBuf, sizeof(brightPrefsBuf));
 }
 
-// Per-channel pot filter state
-static uint16_t gPotRawRing[8][POT_MEDIAN_WIN] = {{0}}; // last N raw reads (median window)
+// ---------- Pot filter state ----------
+static uint16_t gPotRawRing[8][POT_MEDIAN_WIN] = {{0}};
 static uint8_t  gPotRawIdx[8] = {0};
-static uint16_t gPotLastRaw[8] = {0};                   // previous raw read (for noise gate)
-static uint16_t gPotFilt[8] = {0};                      // filtered normalized 0..1023
+static uint16_t gPotLastRaw[8] = {0};
+static uint16_t gPotFilt[8] = {0};
 static bool     gPotInited[8] = {0};
-
-static uint16_t gPotPrevFilt[8] = {0};   // previous filtered value (for crossing detection)
+static uint16_t gPotPrevFilt[8] = {0};
 
 static uint32_t gPotLastSentMs[8] = {0};
 static uint32_t gLastPotScanMs = 0;
@@ -798,17 +838,15 @@ static inline uint16_t u16absdiff(uint16_t a, uint16_t b) {
 }
 
 static inline uint16_t median3_u16(uint16_t a, uint16_t b, uint16_t c) {
-  // Branchy but fast and tiny.
-  if (a > b) { uint16_t t=a; a=b; b=t; } // a<=b
-  if (b > c) { uint16_t t=b; b=c; c=t; } // b<=c
-  if (a > b) { uint16_t t=a; a=b; b=t; } // a<=b
+  if (a > b) { uint16_t t=a; a=b; b=t; }
+  if (b > c) { uint16_t t=b; b=c; c=t; }
+  if (a > b) { uint16_t t=a; a=b; b=t; }
   return b;
 }
 
 static inline uint16_t potHysteresis(CtrlMode m, uint16_t norm0_1023) {
   if (m == MODE_FADER) return POT_HYST_FADER;
   if (m == MODE_TRIM)  return POT_HYST_TRIM;
-  // PAN: increase hysteresis near center to avoid "tick-tick" around 512
   uint16_t d = u16absdiff(norm0_1023, 512);
   return (d < 16) ? (uint16_t)(POT_HYST_PAN + 4) : POT_HYST_PAN;
 }
@@ -848,10 +886,14 @@ static void potsTick() {
     gPotInited[ch] = true;
     gPotFilt[ch] = med;
     gPotPrevFilt[ch] = med;
-    // Seed banks 0..2 with first reading; bank 3 (HOLDED_BANK) already set by holdBankLoad()
-    for (uint8_t m = 0; m < 3; m++) {
-      gBankVal[m][ch] = med;
-      gCaught[m][ch] = (m == (uint8_t)gMode);
+    if (!(gGotDumpFader && gGotDumpTrim && gGotDumpPan)) {
+      gBankVal[MODE_FADER][ch] = 0;
+      gBankVal[MODE_TRIM][ch]  = 0;
+      gBankVal[MODE_PAN][ch]   = 512;
+      if (ch <= 2)
+        gBankVal[HOLDED_BANK][ch] = 818;  // ~80% of 1023
+      for (uint8_t b = 0; b < 4; b++)
+        gCaught[b][ch] = false;
     }
     gPotLastSentMs[ch] = now;
     return;
@@ -868,14 +910,12 @@ static void potsTick() {
   gPotFilt[ch] = f;
 
   uint8_t bank = (gHoldState == HOLD_ACTIVE) ? HOLDED_BANK : (uint8_t)gMode;
-  CtrlMode effMode = (bank == HOLDED_BANK) ? MODE_FADER : gMode;  // HOLD bank uses FADER hysteresis
+  CtrlMode effMode = (bank == HOLDED_BANK) ? MODE_FADER : gMode;
 
-  // --- Pickup / catch gate ---
   if (!gCaught[bank][ch]) {
     uint16_t target = gBankVal[bank][ch];
     uint16_t hyst = potHysteresis(effMode, target);
 
-    // Catch if pot is within hysteresis of target, or has crossed through it
     bool withinHyst = (u16absdiff(f, target) <= hyst);
     bool crossed = ((prevF <= target && f >= target) ||
                     (prevF >= target && f <= target));
@@ -896,7 +936,6 @@ static void potsTick() {
 
   gPotPrevFilt[ch] = f;
 
-  // Output ramp: adaptive step toward target (smooth when close, fast when far); rate-limited by throttle
   if (now - gPotLastSentMs[ch] < POT_SEND_MIN_GAP_MS) return;
 
   int32_t target = (int32_t)f;
@@ -914,11 +953,10 @@ static void potsTick() {
   if (next < 0) next = 0;
   if (next > 1023) next = 1023;
   uint16_t nextVal = (uint16_t)next;
-  if (nextVal == gBankVal[bank][ch]) return;  // no change (shouldn't happen)
+  if (nextVal == gBankVal[bank][ch]) return;
 
   bool ok = false;
   if (bank == HOLDED_BANK) {
-    // POT 0 = LR, POT 1 = MAIN, POT 2 = SUB (output faders; A1 03 05 <ID> <VAL>, VAL 0..121)
     if (ch == 0) {
       ok = sendLrFaderNorm(nextVal);
     } else if (ch == 1) {
@@ -926,7 +964,7 @@ static void potsTick() {
     } else if (ch == 2) {
       ok = sendSubFaderNorm(nextVal);
     } else if (ch <= 5) {
-      ok = true;  // ch 3..5: reserved, no BLE
+      ok = true;
     } else if (ch == 6) {
       gVisionLedBrightnessPercent = (uint8_t)((nextVal * 100u) / 1023u);
       brightSaveVision();
@@ -950,7 +988,7 @@ static void potsTick() {
   }
 }
 
-// ---------- LED VISION V2: catch LEDs (AW9523 pins 0-7) ----------
+// ---------- Catch LEDs (AW9523 pins 0-7) ----------
 static void ledCatchUpdate() {
   if (!gAw9523Ok) return;
   uint8_t bank = (gHoldState == HOLD_ACTIVE) ? HOLDED_BANK : (uint8_t)gMode;
@@ -987,7 +1025,7 @@ static void ledCatchUpdate() {
   }
 }
 
-// ---------- LED VISION V2: VisionLed RGB (AW9523 pins 8,9,10) ----------
+// ---------- VisionLed RGB (AW9523 pins 8,9,10) ----------
 static void visionLedUpdate() {
   if (!gAw9523Ok) return;
 
@@ -1015,7 +1053,6 @@ void setup() {
 
   pinMode(MODE_BTN_PIN, MODE_BTN_PULLUP ? INPUT_PULLUP : INPUT);
 
-  // Boot-time "NO SERIAL" latch: hold MODE button during reset/power-up
   delay(5);
   bool bootPressed = MODE_BTN_PULLUP ? (digitalRead(MODE_BTN_PIN) == LOW) : (digitalRead(MODE_BTN_PIN) == HIGH);
   if (bootPressed) {
@@ -1031,9 +1068,8 @@ void setup() {
     Serial.println("\nZoom BLE AUTO handshake");
   }
 
-  holdBankLoad();  // restore HOLDED_BANK from NVM (or defaults)
 
-  // --- AW9523 init (must come before BLE) ---
+  // AW9523 init
   Wire1.begin();
   gAw9523Ok = aw9523.begin(AW9523_ADDR, &Wire1);
   if (gAw9523Ok) {
@@ -1063,8 +1099,6 @@ void setup() {
 void loop() {
   BLE.poll();
   pollNotifs();
-  keepaliveTick();
-
   autoStep();
   ledUpdate();
 
@@ -1076,7 +1110,6 @@ void loop() {
     visionLedUpdate();
   }
 
-  // Non-blocking serial read (line-based)
   if (gSerialEnabled) {
     while (Serial.available()) {
       char c = (char)Serial.read();

@@ -4,6 +4,15 @@ Single document, two main sections. Implement **HOLD** first (no hardware), then
 
 ---
 
+## Implementation status (vs ZOOM_CONTROL_V4.ino)
+
+| Area | Status | Notes |
+|------|--------|--------|
+| **HOLD** | Implemented except NVM | 4 banks, button behaviour, HOLDED_BANK send rules (POT 0–2 = LR/MAIN/SUB faders, 3–6 no BLE, 7 = brightness), dirty-check + save on quit hold. **Remaining:** persist `gBankVal[3][]` to Flash/NVM (currently `gHoldBankNVM[]` in RAM only). |
+| **LED MISSION** | Not implemented | Placeholder in code: `gCatchLedGlobalBrightnessPercent` is set by POT 7 in HOLDED_BANK; no AW9523, no Wire1, no `ledCatchUpdate()`. |
+
+---
+
 # HOLD
 
 ## 1. Four banks (not three)
@@ -42,9 +51,9 @@ All four banks use the same process: catch value vs stored value, hysteresis, se
 
 ## 5. HOLDED_BANK send semantics (channel rules)
 
-- **POT 0–2**: Act as **FADER** (send BLE fader; type of BLE message may change later). Same catch process; on send use current fader BLE encoding.
-- **POT 3–6**: **Do nothing** (no BLE, no global brightness). Keep place for future use; **read and store** pot state (gBankVal[3][ch], gCaught[3][ch]) so catch/LED and future features can use it.
-- **POT 7**: **Change global brightness only** (no BLE). Update `gCatchLedGlobalBrightnessPercent` from pot value (0–1023 → 0–100); do not send BLE; do not update recorder.
+- **POT 0–2**: Act as **output faders** — send BLE A1 03 05 with fixed IDs (LR, MAIN, SUB). Same catch process; value 0..1023 mapped to device range. *Implemented.*
+- **POT 3–6**: **Do nothing** (no BLE, no global brightness). Keep place for future use; **read and store** pot state (gBankVal[3][ch], gCaught[3][ch]) so catch/LED and future features can use it. *Implemented.*
+- **POT 7**: **Change global brightness only** (no BLE). Update `gCatchLedGlobalBrightnessPercent` from pot value (0–1023 → 0–100); do not send BLE; do not update recorder. *Implemented (variable used by LED MISSION when added).*
 
 ## 6. HOLDED_BANK persistence (non-volatile memory)
 
@@ -53,9 +62,13 @@ All four banks use the same process: catch value vs stored value, hysteresis, se
 - **When to write NVM**: **Only when we quit hold mode**, and **only if** at least one value has changed during that hold session. On transition from hold to normal: compare current `gBankVal[3][ch]` to the values at hold entry (or last-saved); if any channel changed, write the full bank 3 to NVM; if no change, do not write.
 - **Startup**: Read HOLDED_BANK from NVM into `gBankVal[3][0..7]`; set `gCaught[3][i]` as needed (e.g. all false so pots must catch again when next entering hold, or leave as stored if you persist catch state too; recommend “all false” on load so behaviour is predictable).
 
+**Code status:** `holdBankLoad()` / `holdBankSave()` exist; dirty-check on quit hold is implemented; save target is currently RAM (`gHoldBankNVM[]`). **TODO:** write/read `gHoldBankNVM[]` to Flash (e.g. NanoBLEFlashPrefs / InternalFS) for power-cycle persistence.
+
 ---
 
 # LED MISSION
+
+**Status:** Not implemented. Firmware already sets `gCatchLedGlobalBrightnessPercent` from POT 7 in HOLDED_BANK for use when LED MISSION is added.
 
 ## 1. Goal
 
@@ -105,5 +118,5 @@ All four banks use the same process: catch value vs stored value, hysteresis, se
 
 # Order of implementation
 
-1. **HOLD**: 4 banks, HoldModeTime, short press = cycle only, long press = bank 3, HOLDED_BANK send rules (0–2 fader, 3–6 no BLE, 7 brightness), persistence on quit hold if changed.  
-2. **LED MISSION**: Wire1, AW9523, 8 LEDs, ledCatchUpdate(), distance dim, 3-blink, global brightness from POT 7 in hold.
+1. **HOLD** — *Done* except NVM: 4 banks, HOLD_MODE_TIME_MS (500 ms), short press = cycle FADER/PAN/TRIM only, long press = bank 3, HOLDED_BANK send rules (0–2 = LR/MAIN/SUB, 3–6 no BLE, 7 = brightness), dirty-check + save on quit hold. **Remaining:** persist bank 3 to Flash/NVM.
+2. **LED MISSION** — *Pending*: Wire1, AW9523, 8 LEDs, ledCatchUpdate(), distance dim, 3-blink, global brightness from `gCatchLedGlobalBrightnessPercent` (already set by POT 7 in hold).

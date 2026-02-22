@@ -29,6 +29,8 @@
 */
 
 #include <ArduinoBLE.h>
+#include <Wire.h>
+#include <Adafruit_AW9523.h>
 
 // ============================================================================
 //  COMPILE-TIME CONFIG — all user-tunable values grouped here
@@ -110,6 +112,28 @@ static const uint16_t PAN_CENTER_DEAD = 8;          // ±dead zone around norm 5
 static const uint32_t HOLD_MODE_TIME_MS = 500;
 static const uint8_t  HOLDED_BANK       = 3;        // bank index for held values (persisted)
 
+// ---- AW9523 / Catch LEDs --------------------------------------------------
+static const uint8_t AW9523_ADDR         = 0x58;
+static const uint8_t CATCH_LED_DIM_MIN   = 10;   // % of global ceiling when far
+static const uint8_t CATCH_LED_DIM_MAX   = 80;   // % of global ceiling when near
+static const uint8_t CATCH_LED_BLINK_PCT = 100;  // % of global ceiling during blink
+static const uint32_t CATCH_LED_BLINK_HALF_MS = 40; // half-period per blink flash
+
+// ---- VisionLed (common-anode RGB on AW9523 pins 8,9,10) -------------------
+static const uint8_t VLED_PIN_R = 8;
+static const uint8_t VLED_PIN_G = 9;
+static const uint8_t VLED_PIN_B = 10;
+static const uint32_t VLED_NOT_CONNECTED_ON_MS  = 50;
+static const uint32_t VLED_NOT_CONNECTED_OFF_MS = 750;
+
+// Bank color table (R, G, B) -- indexed by effective bank 0-3
+static const uint8_t BANK_COLOR[][3] = {
+  {0,   255, 0  },  // 0 FADER = Green
+  {255, 255, 0  },  // 1 PAN   = Yellow
+  {255, 0,   0  },  // 2 TRIM  = Red
+  {0,   0,   255},  // 3 HOLD  = Blue
+};
+
 // ============================================================================
 
 // ---------- Internal state ----------
@@ -147,7 +171,14 @@ enum HoldState : uint8_t { HOLD_IDLE=0, HOLD_PRESSED, HOLD_ACTIVE };
 static HoldState gHoldState = HOLD_IDLE;
 static uint32_t  gModePressMs = 0;                  // time when MODE was debounced down
 static uint16_t  gHoldEntryBank3[8] = {0};          // snapshot of gBankVal[3][] on hold entry (for dirty check)
-uint8_t gCatchLedGlobalBrightnessPercent = 80;     // set by POT 7 in HOLD bank; for LED MISSION
+
+// ---- AW9523 / LED VISION V2 -------------------------------------------------
+static Adafruit_AW9523 aw9523;
+static bool gAw9523Ok = false;
+static uint8_t gVisionLedBrightnessPercent = 100;  // POT 6 in HOLD; separate from catch LED
+uint8_t gCatchLedGlobalBrightnessPercent = 100;     // set by POT 7 in HOLD bank
+static uint8_t  gBlinkPhase[8] = {0};               // 0=inactive; 1-6 = on/off phases (3 blinks)
+static uint32_t gBlinkStartMs[8] = {0};
 
 // ---------- Family A frames ----------
 struct Frame { const uint8_t* p; uint8_t n; };
@@ -270,69 +301,15 @@ static void hardFail(const char* why) {
   enterState(ST_FAIL, why);
 }
 
-// ---------- LED patterns ----------
-// SCAN       : slow symmetric blink   (1.2 s period)
-// Handshake  : fast symmetric blink   (120 ms period)
-// READY      : heartbeat pulse        (brief 80 ms flash every 2 s)
-// FAIL       : triple-blink burst     (3 short flashes then long pause)
-
+// ---------- LED: built-in only when AW9523 failed (VisionLed handles status when OK) ----------
 static void ledUpdate() {
-  static uint32_t tRef = 0;     // reference timestamp for current pattern
-  uint32_t now = millis();
-
-  switch (st) {
-
-    // --- Scanning: slow blink (600 ms ON / 600 ms OFF) ---
-    case ST_SCAN: {
-      uint32_t elapsed = (now - tRef) % 1200u;
-      digitalWrite(LED_PIN, elapsed < 600 ? HIGH : LOW);
-      break;
-    }
-
-    // --- Handshake: fast blink (60 ms ON / 60 ms OFF) ---
-    case ST_CONNECT:
-    case ST_DISCOVER:
-    case ST_SUBSCRIBE:
-    case ST_KEEPALIVE_ON:
-    case ST_SEND_HELLO:
-    case ST_SEND_FAMILY_A:
-    case ST_WAIT_READY: {
-      uint32_t elapsed = (now - tRef) % 120u;
-      digitalWrite(LED_PIN, elapsed < 60 ? HIGH : LOW);
-      break;
-    }
-
-    // --- Ready: slow breathing via PWM-like soft ramp (4 s cycle) ---
-    case ST_READY: {
-      const uint32_t BREATH_MS = 4000;
-      uint32_t elapsed = (now - tRef) % BREATH_MS;
-      // Triangle wave 0 → 255 → 0 over one cycle
-      uint16_t half = (uint16_t)(BREATH_MS / 2);
-      uint16_t phase = (elapsed < half)
-        ? (uint16_t)((elapsed * 255u) / half)           // ramp up
-        : (uint16_t)(((BREATH_MS - elapsed) * 255u) / half); // ramp down
-      // Gamma-ish curve: square for perceived linearity
-      uint8_t pwm = (uint8_t)((phase * phase) >> 8);
-      analogWrite(LED_PIN, pwm);
-      break;
-    }
-
-    // --- Fail: triple-blink burst (3×80 ms flashes, 120 ms gaps, then 1 s pause) ---
-    // Timeline within 1600 ms cycle:
-    //   0-80 ON, 80-200 OFF, 200-280 ON, 280-400 OFF, 400-480 ON, 480-1600 OFF
-    case ST_FAIL: {
-      uint32_t elapsed = (now - tRef) % 1600u;
-      bool on = (elapsed <  80) ||
-                (elapsed >= 200 && elapsed < 280) ||
-                (elapsed >= 400 && elapsed < 480);
-      digitalWrite(LED_PIN, on ? HIGH : LOW);
-      break;
-    }
-
-    default:
-      digitalWrite(LED_PIN, LOW);
-      break;
+  if (gAw9523Ok) {
+    digitalWrite(LED_PIN, LOW);
+    return;
   }
+  // AW9523 failed: permanent fast blink on built-in LED
+  uint32_t elapsed = millis() % 120u;
+  digitalWrite(LED_PIN, elapsed < 60 ? HIGH : LOW);
 }
 
 // ---------- BLE helpers ----------
@@ -724,7 +701,10 @@ static void modeButtonTick() {
     bool stillPressed = MODE_BTN_PULLUP ? (gLastBtnRead == LOW) : (gLastBtnRead == HIGH);
     if (stillPressed && (now - gModePressMs >= HOLD_MODE_TIME_MS)) {
       gHoldState = HOLD_ACTIVE;
-      for (uint8_t i = 0; i < 8; i++) gHoldEntryBank3[i] = gBankVal[HOLDED_BANK][i];
+      for (uint8_t i = 0; i < 8; i++) {
+        gHoldEntryBank3[i] = gBankVal[HOLDED_BANK][i];
+        gBlinkPhase[i] = 0;
+      }
     }
   }
 
@@ -744,6 +724,7 @@ static void modeButtonTick() {
           bool dirty = false;
           for (uint8_t i = 0; i < 8; i++) {
             if (gBankVal[HOLDED_BANK][i] != gHoldEntryBank3[i]) { dirty = true; break; }
+            gBlinkPhase[i] = 0;
           }
           if (dirty) holdBankSave();
           gHoldState = HOLD_IDLE;
@@ -752,7 +733,10 @@ static void modeButtonTick() {
           if (gMode == MODE_FADER) gMode = MODE_PAN;
           else if (gMode == MODE_PAN) gMode = MODE_TRIM;
           else gMode = MODE_FADER;
-          for (uint8_t i = 0; i < 8; i++) gCaught[(uint8_t)gMode][i] = false;
+          for (uint8_t i = 0; i < 8; i++) {
+            gCaught[(uint8_t)gMode][i] = false;
+            gBlinkPhase[i] = 0;
+          }
           gHoldState = HOLD_IDLE;
         } else {
           gHoldState = HOLD_IDLE;
@@ -775,6 +759,25 @@ static void holdBankLoad() {
 static void holdBankSave() {
   for (uint8_t i = 0; i < 8; i++) gHoldBankNVM[i] = gBankVal[HOLDED_BANK][i];
   // TODO: write gHoldBankNVM to flash (e.g. NanoBLEFlashPrefs / InternalFS) for power-cycle persistence
+}
+
+// Brightness persistence (separate from HOLDED_BANK; RAM placeholder)
+static uint8_t gVisionLedBrightNVM  = 100;
+static uint8_t gCatchLedBrightNVM   = 100;
+
+static void brightLoad() {
+  gVisionLedBrightnessPercent      = gVisionLedBrightNVM;
+  gCatchLedGlobalBrightnessPercent = gCatchLedBrightNVM;
+}
+
+static void brightSaveVision() {
+  gVisionLedBrightNVM = gVisionLedBrightnessPercent;
+  // TODO: write to flash (NanoBLEFlashPrefs)
+}
+
+static void brightSaveCatch() {
+  gCatchLedBrightNVM = gCatchLedGlobalBrightnessPercent;
+  // TODO: write to flash (NanoBLEFlashPrefs)
 }
 
 // Per-channel pot filter state
@@ -879,7 +882,10 @@ static void potsTick() {
 
     if (withinHyst || crossed) {
       gCaught[bank][ch] = true;
-      // Snap to target so first send doesn't jump
+      if (bank != HOLDED_BANK) {
+        gBlinkPhase[ch] = 1;
+        gBlinkStartMs[ch] = millis();
+      }
       f = target;
       gPotFilt[ch] = f;
     } else {
@@ -919,11 +925,16 @@ static void potsTick() {
       ok = sendMainFaderNorm(nextVal);
     } else if (ch == 2) {
       ok = sendSubFaderNorm(nextVal);
-    } else if (ch <= 6) {
-      ok = true;  // ch 3..6: no BLE, just update bank state
+    } else if (ch <= 5) {
+      ok = true;  // ch 3..5: reserved, no BLE
+    } else if (ch == 6) {
+      gVisionLedBrightnessPercent = (uint8_t)((nextVal * 100u) / 1023u);
+      brightSaveVision();
+      ok = true;
     } else {
       gCatchLedGlobalBrightnessPercent = (uint8_t)((nextVal * 100u) / 1023u);
-      ok = true;  // ch 7: global brightness (LED MISSION)
+      brightSaveCatch();
+      ok = true;
     }
   } else {
     switch (gMode) {
@@ -936,6 +947,65 @@ static void potsTick() {
   if (ok) {
     gBankVal[bank][ch] = nextVal;
     gPotLastSentMs[ch] = now;
+  }
+}
+
+// ---------- LED VISION V2: catch LEDs (AW9523 pins 0-7) ----------
+static void ledCatchUpdate() {
+  if (!gAw9523Ok) return;
+  uint8_t bank = (gHoldState == HOLD_ACTIVE) ? HOLDED_BANK : (uint8_t)gMode;
+  uint32_t now = millis();
+
+  for (uint8_t ch = 0; ch < 8; ch++) {
+    if (gBlinkPhase[ch] > 0) {
+      uint32_t elapsed = now - gBlinkStartMs[ch];
+      uint8_t phase = (uint8_t)(elapsed / CATCH_LED_BLINK_HALF_MS);
+      if (phase >= 6) {
+        gBlinkPhase[ch] = 0;
+        aw9523.analogWrite(ch, 0);
+      } else {
+        bool on = ((phase & 1) == 0);
+        uint8_t val = on
+          ? (uint8_t)((uint32_t)CATCH_LED_BLINK_PCT * gCatchLedGlobalBrightnessPercent * 255u / 10000u)
+          : 0;
+        aw9523.analogWrite(ch, val);
+      }
+      continue;
+    }
+
+    if (gCaught[bank][ch]) {
+      aw9523.analogWrite(ch, 0);
+      continue;
+    }
+
+    uint16_t target = gBankVal[bank][ch];
+    uint16_t dist = u16absdiff(gPotFilt[ch], target);
+    uint8_t dimPct = CATCH_LED_DIM_MAX
+      - (uint8_t)((uint32_t)dist * (CATCH_LED_DIM_MAX - CATCH_LED_DIM_MIN) / 1023u);
+    uint8_t val = (uint8_t)((uint32_t)dimPct * gCatchLedGlobalBrightnessPercent * 255u / 10000u);
+    aw9523.analogWrite(ch, val);
+  }
+}
+
+// ---------- LED VISION V2: VisionLed RGB (AW9523 pins 8,9,10) ----------
+static void visionLedUpdate() {
+  if (!gAw9523Ok) return;
+
+  if (st == ST_READY) {
+    uint8_t bank = (gHoldState == HOLD_ACTIVE) ? HOLDED_BANK : (uint8_t)gMode;
+    uint8_t r = (uint8_t)((uint16_t)BANK_COLOR[bank][0] * gVisionLedBrightnessPercent / 100u);
+    uint8_t g = (uint8_t)((uint16_t)BANK_COLOR[bank][1] * gVisionLedBrightnessPercent / 100u);
+    uint8_t b = (uint8_t)((uint16_t)BANK_COLOR[bank][2] * gVisionLedBrightnessPercent / 100u);
+    aw9523.analogWrite(VLED_PIN_R, r);
+    aw9523.analogWrite(VLED_PIN_G, g);
+    aw9523.analogWrite(VLED_PIN_B, b);
+  } else {
+    const uint32_t period = VLED_NOT_CONNECTED_ON_MS + VLED_NOT_CONNECTED_OFF_MS;
+    uint32_t phase = millis() % period;
+    uint8_t val = (phase < VLED_NOT_CONNECTED_ON_MS) ? 255 : 0;
+    aw9523.analogWrite(VLED_PIN_R, val);
+    aw9523.analogWrite(VLED_PIN_G, val);
+    aw9523.analogWrite(VLED_PIN_B, val);
   }
 }
 
@@ -961,6 +1031,21 @@ void setup() {
     Serial.println("\nZoom BLE AUTO handshake");
   }
 
+  holdBankLoad();  // restore HOLDED_BANK from NVM (or defaults)
+
+  // --- AW9523 init (must come before BLE) ---
+  Wire1.begin();
+  gAw9523Ok = aw9523.begin(AW9523_ADDR, &Wire1);
+  if (gAw9523Ok) {
+    for (uint8_t i = 0; i <= 10; i++)
+      aw9523.pinMode(i, AW9523_LED_MODE);
+    for (uint8_t i = 0; i <= 10; i++)
+      aw9523.analogWrite(i, 0);
+  } else {
+    if (gSerialEnabled) startupPrint("AW9523 init FAILED");
+  }
+  brightLoad();
+
   if (!BLE.begin()) {
     if (gSerialEnabled) Serial.println("BLE.begin() failed");
     while(1){}
@@ -972,7 +1057,6 @@ void setup() {
     enterState(ST_FAIL, "disconnected");
   });
 
-  holdBankLoad();  // restore HOLDED_BANK from NVM (or defaults)
   enterState(ST_BOOT, "setup done");
 }
 
@@ -984,9 +1068,13 @@ void loop() {
   autoStep();
   ledUpdate();
 
-  // placeholder I/O layer
   modeButtonTick();
   potsTick();
+
+  if (gAw9523Ok) {
+    if (st == ST_READY) ledCatchUpdate();
+    visionLedUpdate();
+  }
 
   // Non-blocking serial read (line-based)
   if (gSerialEnabled) {

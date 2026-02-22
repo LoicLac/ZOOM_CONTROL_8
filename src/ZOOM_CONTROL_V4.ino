@@ -71,27 +71,25 @@ static const char* UUID_FLOW_CTRL      = "064131ea-592c-3ad9-4f8f-71db1b192828";
 static const uint32_t POTS_SCAN_PERIOD_MS = 1;     // round-robin read interval (ms)
 static const uint8_t  POT_MEDIAN_WIN      = 3;     // median filter window size (fixed median-of-3)
 
-// ---- Pot: EMA smoothing ----------------------------------------------------
-// Exponential Moving Average:  filtered += (raw - filtered) >> POT_EMA_SHIFT
-//   shift 1 → alpha 1/2   (fast, noisy)
-//   shift 2 → alpha 1/4
-//   shift 3 → alpha 1/8   (default — good balance)
-//   shift 4 → alpha 1/16  (smooth, sluggish)
-static const uint8_t  POT_EMA_SHIFT       = 3;
+// ---- Pot: EMA smoothing (per type) -----------------------------------------
+// Exponential Moving Average:  filtered += (raw - filtered) >> shift
+//   shift 0 → alpha 1     (pass-through, no smoothing)
+//   shift 1 → alpha 1/2   (fast)
+//   shift 2 → alpha 1/4   (responsive)
+//   shift 3 → alpha 1/8   (smooth)
+//   shift 4 → alpha 1/16  (very smooth, sluggish)
+static const uint8_t  POT_EMA_SHIFT_FADER = 3;     // smooth continuous fader feel
+static const uint8_t  POT_EMA_SHIFT_PAN   = 2;     // responsive, less lag than fader
+static const uint8_t  POT_EMA_SHIFT_TRIM  = 0;     // no smoothing — immediate discrete steps
+static const uint8_t  POT_FRAC_BITS       = 8;     // fixed-point fractional bits (eliminates EMA integer stall)
 
 // ---- Pot: Noise gate & endpoint snap ---------------------------------------
 static const uint16_t POT_NOISE_GATE      = 2;     // ignore raw ADC change smaller than this
 static const uint16_t POT_SNAP_MARGIN     = 6;     // snap to 0 or 1023 when within this margin
 
 // ---- Pot: Send throttle ----------------------------------------------------
-// Tuned for max ~3 faders at once; BLE can do ~66-133 writes/s total.
 static const uint32_t POT_SEND_MIN_GAP_MS = 12;    // per-channel min send interval (ms)
-
-// ---- Pot: Output ramp (adaptive: smooth when close, fast catch-up when far) ----
-// step = clamp(delta / DIV, MIN, MAX). Small move -> step 1; big move -> step up to MAX.
-static const uint16_t POT_RAMP_STEP_MIN   = 1;     // smoothness for small range / fine moves
-static const uint16_t POT_RAMP_STEP_MAX   = 128;   // catch-up: full range in ~8 sends (~0.2 s)
-static const uint16_t POT_RAMP_ADAPTIVE_DIV = 8;   // delta/8 -> step; big delta -> big step sooner
+static const uint32_t BLE_GLOBAL_MIN_GAP_MS = 15;  // min gap between ANY two pot BLE writes (global)
 
 // ---- Pot: Hysteresis (on normalized 0..1023, per mode) ---------------------
 // Change vs last-sent value must exceed this to trigger a new BLE send.
@@ -363,7 +361,7 @@ static void onTxNotification(BLEDevice, BLECharacteristic) {
     if (subcmd == 0x02 && !gGotDumpFader) {
       for (uint8_t i = 0; i < 8; i++)
         gBankVal[MODE_FADER][i] = mapFaderRawToNorm(buf[3 + i]);
-      gBankVal[HOLDED_BANK][0] = mapOutputFaderRawToNorm(buf[11], 109);
+      gBankVal[HOLDED_BANK][0] = mapOutputFaderRawToNorm(buf[11], 121);
       gBankVal[HOLDED_BANK][1] = mapOutputFaderRawToNorm(buf[13], 121);
       gBankVal[HOLDED_BANK][2] = mapOutputFaderRawToNorm(buf[15], 121);
       gGotDumpFader = true;
@@ -749,6 +747,10 @@ static void modeButtonTick() {
         gHoldEntryBank3[i] = gBankVal[HOLDED_BANK][i];
         gBlinkPhase[i] = 0;
       }
+      // So LR/MAIN/SUB are only sent when user actually moves fader 0/1/2 while HOLD is active
+      gCaught[HOLDED_BANK][0] = false;
+      gCaught[HOLDED_BANK][1] = false;
+      gCaught[HOLDED_BANK][2] = false;
     }
   }
 
@@ -825,13 +827,15 @@ static void brightSaveCatch() {
 static uint16_t gPotRawRing[8][POT_MEDIAN_WIN] = {{0}};
 static uint8_t  gPotRawIdx[8] = {0};
 static uint16_t gPotLastRaw[8] = {0};
-static uint16_t gPotFilt[8] = {0};
+static int32_t  gPotFiltFP[8] = {0};               // fixed-point EMA accumulator (<<POT_FRAC_BITS)
+static uint16_t gPotFilt[8] = {0};                  // integer output (for LED distance display)
 static bool     gPotInited[8] = {0};
 static uint16_t gPotPrevFilt[8] = {0};
 
 static uint32_t gPotLastSentMs[8] = {0};
 static uint32_t gLastPotScanMs = 0;
 static uint8_t  gPotScanCh = 0;
+static uint32_t gLastGlobalBleWriteMs = 0;
 
 static inline uint16_t u16absdiff(uint16_t a, uint16_t b) {
   return (a > b) ? (a - b) : (b - a);
@@ -881,9 +885,18 @@ static void potsTick() {
   uint16_t r2 = gPotRawRing[ch][2];
   uint16_t med = median3_u16(r0, r1, r2);
 
-  // EMA filter
+  // Determine effective bank/mode early (needed for per-type EMA shift)
+  uint8_t bank = (gHoldState == HOLD_ACTIVE) ? HOLDED_BANK : (uint8_t)gMode;
+  CtrlMode effMode = (bank == HOLDED_BANK) ? MODE_FADER : gMode;
+
+  uint8_t emaShift = POT_EMA_SHIFT_FADER;
+  if (effMode == MODE_PAN)  emaShift = POT_EMA_SHIFT_PAN;
+  if (effMode == MODE_TRIM) emaShift = POT_EMA_SHIFT_TRIM;
+
+  // EMA filter (fixed-point accumulator — no integer stall zone)
   if (!gPotInited[ch]) {
     gPotInited[ch] = true;
+    gPotFiltFP[ch] = (int32_t)med << POT_FRAC_BITS;
     gPotFilt[ch] = med;
     gPotPrevFilt[ch] = med;
     if (!(gGotDumpFader && gGotDumpTrim && gGotDumpPan)) {
@@ -891,7 +904,7 @@ static void potsTick() {
       gBankVal[MODE_TRIM][ch]  = 0;
       gBankVal[MODE_PAN][ch]   = 512;
       if (ch <= 2)
-        gBankVal[HOLDED_BANK][ch] = 818;  // ~80% of 1023
+        gBankVal[HOLDED_BANK][ch] = 818;
       for (uint8_t b = 0; b < 4; b++)
         gCaught[b][ch] = false;
     }
@@ -900,17 +913,21 @@ static void potsTick() {
   }
 
   uint16_t prevF = gPotFilt[ch];
-  int16_t err = (int16_t)med - (int16_t)prevF;
-  uint16_t f = (uint16_t)((int32_t)prevF + ((int32_t)err >> POT_EMA_SHIFT));
+  int32_t med_fp = (int32_t)med << POT_FRAC_BITS;
+  int32_t err_fp = med_fp - gPotFiltFP[ch];
+  gPotFiltFP[ch] += (err_fp >> emaShift);
+  uint16_t f = (uint16_t)(gPotFiltFP[ch] >> POT_FRAC_BITS);
 
-  // Snap to endpoints when near 0 or 1023
-  if (f <= POT_SNAP_MARGIN)              f = 0;
-  else if (f >= (1023 - POT_SNAP_MARGIN)) f = 1023;
+  // Snap to endpoints when near 0 or 1023 (sync fixed-point accumulator)
+  if (f <= POT_SNAP_MARGIN) {
+    f = 0;
+    gPotFiltFP[ch] = 0;
+  } else if (f >= (1023 - POT_SNAP_MARGIN)) {
+    f = 1023;
+    gPotFiltFP[ch] = (int32_t)1023 << POT_FRAC_BITS;
+  }
 
   gPotFilt[ch] = f;
-
-  uint8_t bank = (gHoldState == HOLD_ACTIVE) ? HOLDED_BANK : (uint8_t)gMode;
-  CtrlMode effMode = (bank == HOLDED_BANK) ? MODE_FADER : gMode;
 
   if (!gCaught[bank][ch]) {
     uint16_t target = gBankVal[bank][ch];
@@ -937,22 +954,37 @@ static void potsTick() {
   gPotPrevFilt[ch] = f;
 
   if (now - gPotLastSentMs[ch] < POT_SEND_MIN_GAP_MS) return;
+  if (now - gLastGlobalBleWriteMs < BLE_GLOBAL_MIN_GAP_MS) return;
 
-  int32_t target = (int32_t)f;
-  int32_t cur = (int32_t)gBankVal[bank][ch];
-  int32_t delta = target - cur;
-  if (delta == 0) return;
+  uint16_t nextVal = f;
+  if (nextVal == gBankVal[bank][ch]) return;
 
-  uint16_t step = (uint16_t)(delta > 0 ? delta : -delta);
-  step = (uint16_t)(step / (uint32_t)POT_RAMP_ADAPTIVE_DIV);
-  if (step < POT_RAMP_STEP_MIN) step = POT_RAMP_STEP_MIN;
-  if (step > POT_RAMP_STEP_MAX) step = POT_RAMP_STEP_MAX;
-
-  int32_t next = cur + (delta > 0 ? (int32_t)step : -(int32_t)step);
-  if ((delta > 0 && next > target) || (delta < 0 && next < target)) next = target;
-  if (next < 0) next = 0;
-  if (next > 1023) next = 1023;
-  uint16_t nextVal = (uint16_t)next;
+  // Raw-change filters: only send when the actual BLE value changes.
+  // Fader/output fader: no remap (send function handles norm→raw conversion).
+  // Trim/pan: remap to snap gBankVal to raw step boundary (consistent mappings).
+  if (bank == HOLDED_BANK) {
+    if (ch <= 2) {
+      uint8_t newRaw = mapNormToOutputFaderRaw(nextVal);
+      uint8_t curRaw = mapNormToOutputFaderRaw(gBankVal[bank][ch]);
+      if (newRaw == curRaw) return;
+    }
+  } else if (effMode == MODE_FADER) {
+    uint8_t newRaw = mapNormToFaderRaw(nextVal);
+    uint8_t curRaw = mapNormToFaderRaw(gBankVal[bank][ch]);
+    if (newRaw == curRaw) return;
+  } else if (effMode == MODE_TRIM) {
+    uint8_t newRaw = mapNormToTrimRaw(nextVal);
+    uint8_t curRaw = mapNormToTrimRaw(gBankVal[bank][ch]);
+    if (newRaw == curRaw) return;
+    nextVal = mapTrimRawToNorm(newRaw);
+  } else if (effMode == MODE_PAN) {
+    uint8_t newAmt, newSide;
+    mapNormToPan(nextVal, newAmt, newSide);
+    uint8_t curAmt, curSide;
+    mapNormToPan(gBankVal[bank][ch], curAmt, curSide);
+    if (curAmt == newAmt && curSide == newSide) return;
+    nextVal = mapPanRawToNorm(newAmt, newSide);
+  }
   if (nextVal == gBankVal[bank][ch]) return;
 
   bool ok = false;
@@ -985,6 +1017,7 @@ static void potsTick() {
   if (ok) {
     gBankVal[bank][ch] = nextVal;
     gPotLastSentMs[ch] = now;
+    gLastGlobalBleWriteMs = now;
   }
 }
 
